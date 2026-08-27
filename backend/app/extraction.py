@@ -50,7 +50,43 @@ def _match_score(query: str, title: str) -> float:
     token_coverage = len(query_tokens & title_tokens) / len(query_tokens)
     sequence_score = SequenceMatcher(None, query_norm, title_norm).ratio()
     exact_bonus = 0.15 if query_norm in title_norm else 0.0
-    return min(1.0, 0.65 * token_coverage + 0.35 * sequence_score + exact_bonus)
+    accessory_words = {
+        "case",
+        "charger",
+        "cover",
+        "keyboard",
+        "mount",
+        "protector",
+        "replacement",
+        "sleeve",
+        "stand",
+        "stylus",
+    }
+    accessory_penalty = 0.35 if (title_tokens - query_tokens) & accessory_words else 0.0
+    return max(
+        0.0,
+        min(
+            1.0,
+            0.65 * token_coverage + 0.35 * sequence_score + exact_bonus - accessory_penalty,
+        ),
+    )
+
+
+def _is_likely_accessory(query: str, title: str) -> bool:
+    query_tokens = set(re.sub(r"[^a-z0-9]+", " ", query.lower()).split())
+    title_tokens = set(re.sub(r"[^a-z0-9]+", " ", title.lower()).split())
+    accessory_words = {
+        "case",
+        "charger",
+        "cover",
+        "keyboard",
+        "mount",
+        "protector",
+        "replacement",
+        "sleeve",
+        "stand",
+    }
+    return bool((title_tokens - query_tokens) & accessory_words)
 
 
 def find_best_candidate(html: str, query: str, site: SiteDefinition) -> SearchCandidate:
@@ -72,7 +108,12 @@ def find_best_candidate(html: str, query: str, site: SiteDefinition) -> SearchCa
     if not candidates:
         raise ValueError("No product links were found on the search page")
 
-    best = max(candidates.values(), key=lambda candidate: candidate.score)
+    products = [
+        candidate
+        for candidate in candidates.values()
+        if not _is_likely_accessory(query, candidate.title)
+    ]
+    best = max(products or candidates.values(), key=lambda candidate: candidate.score)
     if best.score < 0.35:
         raise ValueError("The search results did not contain a sufficiently similar product")
     return best
@@ -157,7 +198,12 @@ def _meta_content(soup: BeautifulSoup, *selectors: str) -> str | None:
         element = soup.select_one(selector)
         if not element:
             continue
-        value = element.get("content") or element.get_text(" ", strip=True)
+        value = (
+            element.get("content")
+            or element.get("title")
+            or element.get("aria-label")
+            or element.get_text(" ", strip=True)
+        )
         if value:
             return normalize_text(str(value))
     return None
@@ -170,6 +216,7 @@ def extract_product(html: str) -> ProductFields:
     title = (structured.title if structured else None) or _meta_content(
         soup,
         'meta[property="og:title"]',
+        "#productTitle",
         "h1",
     )
     price = (structured.price if structured else None) or _format_price(
@@ -184,11 +231,16 @@ def extract_product(html: str) -> ProductFields:
         _meta_content(soup, 'meta[property="product:price:currency"]'),
     )
     rating = (structured.rating if structured else None) or _parse_rating(
-        _meta_content(soup, '[itemprop="ratingValue"]', '[data-testid="reviews-and-ratings"]')
+        _meta_content(
+            soup,
+            '[itemprop="ratingValue"]',
+            "#acrPopover",
+            ".a-icon-star .a-icon-alt",
+            '[data-testid="reviews-and-ratings"]',
+        )
     )
     review_count = (structured.review_count if structured else None) or _parse_review_count(
         _meta_content(soup, '[itemprop="reviewCount"]', '#acrCustomerReviewText')
     )
 
     return ProductFields(title=title, price=price, rating=rating, review_count=review_count)
-

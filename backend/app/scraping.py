@@ -1,7 +1,9 @@
 import asyncio
+import inspect
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from typing import Protocol
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 import httpx
 
@@ -31,12 +33,89 @@ class BasicScraper:
         return extract_product(product_response.text), candidate.url
 
 
+@dataclass(slots=True)
+class BrowserScraper:
+    method: ScrapeMethod = ScrapeMethod.BROWSER
+    navigation_timeout_ms: int = 30_000
+    settle_delay_ms: int = 1_500
+    _startup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _playwright: Any = field(default=None, init=False)
+    _browser: Any = field(default=None, init=False)
+
+    async def _ensure_browser(self) -> Any:
+        if self._browser is not None:
+            return self._browser
+
+        async with self._startup_lock:
+            if self._browser is not None:
+                return self._browser
+
+            from playwright.async_api import async_playwright
+
+            self._playwright = await async_playwright().start()
+            try:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+            except Exception:
+                await self._playwright.stop()
+                self._playwright = None
+                raise
+            return self._browser
+
+    async def scrape(self, site: SiteDefinition, query: str) -> tuple[ProductFields, str]:
+        browser = await self._ensure_browser()
+        page = await browser.new_page(
+            locale="en-US",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+        )
+        page.set_default_navigation_timeout(self.navigation_timeout_ms)
+
+        try:
+            await self._navigate(page, site.search_url(query))
+            candidate = find_best_candidate(await page.content(), query, site)
+
+            await self._navigate(page, candidate.url)
+            return extract_product(await page.content()), candidate.url
+        finally:
+            await page.close()
+
+    async def _navigate(self, page: Any, url: str) -> None:
+        response = await page.goto(url, wait_until="domcontentloaded")
+        if response is not None and not response.ok:
+            raise RuntimeError(f"Browser received HTTP {response.status} for {url}")
+        await page.wait_for_timeout(self.settle_delay_ms)
+
+    async def close(self) -> None:
+        browser, playwright = self._browser, self._playwright
+        self._browser = None
+        self._playwright = None
+        if browser is not None:
+            with suppress(Exception):
+                await browser.close()
+        if playwright is not None:
+            with suppress(Exception):
+                await playwright.stop()
+
+
+def _describe_error(exc: Exception) -> str:
+    message = str(exc).strip()
+    return message or type(exc).__name__
+
+
 class ScraperService:
     def __init__(
         self,
         strategy_factory: Callable[[httpx.AsyncClient], Sequence[ScrapeStrategy]] | None = None,
     ) -> None:
-        self._strategy_factory = strategy_factory or (lambda client: (BasicScraper(client),))
+        self._strategy_factory = strategy_factory or (
+            lambda client: (BasicScraper(client), BrowserScraper())
+        )
 
     async def search(self, query: str) -> list[ProductResult]:
         normalized_query = " ".join(query.split())
@@ -54,11 +133,23 @@ class ScraperService:
             follow_redirects=True,
         ) as client:
             strategies = tuple(self._strategy_factory(client))
-            return list(
-                await asyncio.gather(
-                    *(self._scrape_site(site, normalized_query, strategies) for site in SITES)
+            try:
+                return list(
+                    await asyncio.gather(
+                        *(self._scrape_site(site, normalized_query, strategies) for site in SITES)
+                    )
                 )
-            )
+            finally:
+                await self._close_strategies(strategies)
+
+    async def _close_strategies(self, strategies: Sequence[ScrapeStrategy]) -> None:
+        for strategy in strategies:
+            close = getattr(strategy, "close", None)
+            if close is None:
+                continue
+            result = close()
+            if inspect.isawaitable(result):
+                await result
 
     async def _scrape_site(
         self,
@@ -85,7 +176,7 @@ class ScraperService:
                 )
             # A third-party scraper can fail in unexpected ways. Isolation is a core API promise.
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{strategy.method.value}: {exc}")
+                errors.append(f"{strategy.method.value}: {_describe_error(exc)}")
 
         return ProductResult(
             website=site.name,

@@ -20,6 +20,7 @@ SITES: tuple[SiteDefinition, ...] = (
         search_url_template="https://www.amazon.com/s?k={query}",
         result_link_selectors=(
             '[data-component-type="s-search-result"] h2 a',
+            'a.a-link-normal.a-text-normal[href*="/dp/"]',
             "a.a-link-normal.s-no-outline",
         ),
     ),
@@ -45,4 +46,3 @@ SITES: tuple[SiteDefinition, ...] = (
         result_link_selectors=(".item-cell .item-title", "a.item-title"),
     ),
 )
-
