@@ -10,6 +10,29 @@ from bs4 import BeautifulSoup
 
 from .sites import SiteDefinition
 
+_ACCESSORY_WORDS = frozenset(
+    {
+        "adapter",
+        "cable",
+        "case",
+        "charger",
+        "cover",
+        "dock",
+        "keyboard",
+        "mount",
+        "pen",
+        "pencil",
+        "protector",
+        "replacement",
+        "skin",
+        "sleeve",
+        "stand",
+        "stylus",
+    }
+)
+
+_NULL_TEXT = frozenset({"", "n/a", "na", "none", "not available", "null", "unknown"})
+
 
 @dataclass(frozen=True, slots=True)
 class ProductFields:
@@ -19,13 +42,20 @@ class ProductFields:
     review_count: int | None
 
     def missing_fields(self) -> list[str]:
-        values = {
-            "product title": self.title,
-            "price": self.price,
-            "average rating": self.rating,
-            "review count": self.review_count,
-        }
-        return [name for name, value in values.items() if value is None]
+        missing: list[str] = []
+        if self.title is None or normalize_text(self.title).lower() in _NULL_TEXT:
+            missing.append("product title")
+        if (
+            self.price is None
+            or normalize_text(self.price).lower() in _NULL_TEXT
+            or not re.search(r"\d", self.price)
+        ):
+            missing.append("price")
+        if self.rating is None or not 0 <= self.rating <= 5:
+            missing.append("average rating")
+        if self.review_count is None or self.review_count < 0:
+            missing.append("review count")
+        return missing
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,19 +80,7 @@ def _match_score(query: str, title: str) -> float:
     token_coverage = len(query_tokens & title_tokens) / len(query_tokens)
     sequence_score = SequenceMatcher(None, query_norm, title_norm).ratio()
     exact_bonus = 0.15 if query_norm in title_norm else 0.0
-    accessory_words = {
-        "case",
-        "charger",
-        "cover",
-        "keyboard",
-        "mount",
-        "protector",
-        "replacement",
-        "sleeve",
-        "stand",
-        "stylus",
-    }
-    accessory_penalty = 0.35 if (title_tokens - query_tokens) & accessory_words else 0.0
+    accessory_penalty = 0.35 if _is_likely_accessory(query, title) else 0.0
     return max(
         0.0,
         min(
@@ -74,19 +92,42 @@ def _match_score(query: str, title: str) -> float:
 
 def _is_likely_accessory(query: str, title: str) -> bool:
     query_tokens = set(re.sub(r"[^a-z0-9]+", " ", query.lower()).split())
+    title_tokens = re.sub(r"[^a-z0-9]+", " ", title.lower()).split()
+    unexpected_positions = [
+        index
+        for index, token in enumerate(title_tokens)
+        if token in _ACCESSORY_WORDS and token not in query_tokens
+    ]
+    if not unexpected_positions:
+        return False
+
+    # Accessories usually lead the title ("Case for...", "Tab Pen..."). A genuine
+    # bundle such as "Lenovo Tab P12 tablet with pen" names the requested product first.
+    return min(unexpected_positions) <= 2
+
+
+def is_product_match(query: str, title: str, minimum_score: float = 0.35) -> bool:
+    """Return whether a scraped title is relevant enough and is not an accessory."""
+    query_tokens = set(re.sub(r"[^a-z0-9]+", " ", query.lower()).split())
     title_tokens = set(re.sub(r"[^a-z0-9]+", " ", title.lower()).split())
-    accessory_words = {
-        "case",
-        "charger",
-        "cover",
-        "keyboard",
-        "mount",
-        "protector",
-        "replacement",
-        "sleeve",
-        "stand",
+    model_tokens = {
+        token
+        for token in query_tokens
+        if any(character.isalpha() for character in token)
+        and any(character.isdigit() for character in token)
     }
-    return bool((title_tokens - query_tokens) & accessory_words)
+    if not model_tokens:
+        model_tokens = {
+            token
+            for token in query_tokens
+            if token.isdigit() and not (len(token) == 4 and 1900 <= int(token) <= 2099)
+        }
+
+    return (
+        model_tokens <= title_tokens
+        and not _is_likely_accessory(query, title)
+        and _match_score(query, title) >= minimum_score
+    )
 
 
 def find_best_candidate(html: str, query: str, site: SiteDefinition) -> SearchCandidate:
@@ -113,7 +154,10 @@ def find_best_candidate(html: str, query: str, site: SiteDefinition) -> SearchCa
         for candidate in candidates.values()
         if not _is_likely_accessory(query, candidate.title)
     ]
-    best = max(products or candidates.values(), key=lambda candidate: candidate.score)
+    if not products:
+        raise ValueError("The search results contained only accessories")
+
+    best = max(products, key=lambda candidate: candidate.score)
     if best.score < 0.35:
         raise ValueError("The search results did not contain a sufficiently similar product")
     return best
