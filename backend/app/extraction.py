@@ -13,20 +13,31 @@ from .sites import SiteDefinition
 _ACCESSORY_WORDS = frozenset(
     {
         "adapter",
+        "battery",
         "cable",
         "case",
         "charger",
         "cover",
+        "cushion",
+        "cushions",
         "dock",
+        "earpad",
+        "earpads",
+        "hinge",
+        "hinges",
         "keyboard",
         "mount",
+        "pad",
+        "pads",
         "pen",
         "pencil",
         "protector",
         "replacement",
+        "shell",
         "skin",
         "sleeve",
         "stand",
+        "strap",
         "stylus",
     }
 )
@@ -149,13 +160,21 @@ def find_best_candidate(html: str, query: str, site: SiteDefinition) -> SearchCa
     if not candidates:
         raise ValueError("No product links were found on the search page")
 
-    products = [
+    non_accessories = [
         candidate
         for candidate in candidates.values()
         if not _is_likely_accessory(query, candidate.title)
     ]
-    if not products:
+    if not non_accessories:
         raise ValueError("The search results contained only accessories")
+
+    products = [
+        candidate
+        for candidate in non_accessories
+        if is_product_match(query, candidate.title, minimum_score=0)
+    ]
+    if not products:
+        raise ValueError("The search results did not contain the requested product model")
 
     best = max(products, key=lambda candidate: candidate.score)
     if best.score < 0.35:
@@ -257,24 +276,29 @@ def extract_product(html: str) -> ProductFields:
     soup = BeautifulSoup(html, "html.parser")
     structured = _product_from_json_ld(soup)
 
-    title = (structured.title if structured else None) or _meta_content(
+    title = _meta_content(
         soup,
         'meta[property="og:title"]',
         "#productTitle",
         "h1",
-    )
-    price = (structured.price if structured else None) or _format_price(
+    ) or (structured.title if structured else None)
+    price = _format_price(
         _meta_content(
             soup,
             'meta[property="product:price:amount"]',
-            '[itemprop="price"]',
-            ".a-price .a-offscreen",
+            '[data-testid="price-block-customer-price"] .sr-only',
+            "#corePrice_feature_div .a-price .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#apex_desktop .a-price .a-offscreen",
+            "#price_inside_buybox",
+            "#priceblock_ourprice",
             ".priceView-customer-price span",
             ".price-current",
+            '[itemprop="price"]',
         ),
         _meta_content(soup, 'meta[property="product:price:currency"]'),
-    )
-    rating = (structured.rating if structured else None) or _parse_rating(
+    ) or (structured.price if structured else None)
+    parsed_rating = _parse_rating(
         _meta_content(
             soup,
             '[itemprop="ratingValue"]',
@@ -283,8 +307,14 @@ def extract_product(html: str) -> ProductFields:
             '[data-testid="reviews-and-ratings"]',
         )
     )
-    review_count = (structured.review_count if structured else None) or _parse_review_count(
-        _meta_content(soup, '[itemprop="reviewCount"]', '#acrCustomerReviewText')
+    rating = parsed_rating if parsed_rating is not None else (structured.rating if structured else None)
+    parsed_review_count = _parse_review_count(
+        _meta_content(soup, '[itemprop="reviewCount"]', "#acrCustomerReviewText")
+    )
+    review_count = (
+        parsed_review_count
+        if parsed_review_count is not None
+        else (structured.review_count if structured else None)
     )
 
     return ProductFields(title=title, price=price, rating=rating, review_count=review_count)

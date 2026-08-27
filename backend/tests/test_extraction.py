@@ -35,6 +35,21 @@ def test_does_not_prefer_an_accessory_with_more_query_tokens() -> None:
     assert result.url == "https://www.amazon.com/tablet/dp/1"
 
 
+def test_candidate_selection_requires_the_exact_model_token() -> None:
+    html = """
+    <div data-component-type="s-search-result">
+      <h2><a href="/2s">Logitech MX Master 2S Wireless Mouse</a></h2>
+    </div>
+    <div data-component-type="s-search-result">
+      <h2><a href="/3s">Logitech MX Master 3S Performance Wireless Mouse</a></h2>
+    </div>
+    """
+
+    result = find_best_candidate(html, "Logitech MX Master 3S", SITES[0])
+
+    assert result.url == "https://www.amazon.com/3s"
+
+
 def test_rejects_a_pen_that_mentions_the_requested_tablet() -> None:
     title = (
         "Tab Pen Plus for Lenovo Tab Pen Plus AP500U Compatible with Lenovo Tab M11, "
@@ -48,6 +63,12 @@ def test_rejects_a_case_even_when_compatibility_text_says_tablet() -> None:
     title = 'Case for Lenovo Tab P12 (2024) 12.7" Tablet with Multi-Angle Stand Cover'
 
     assert not is_product_match("Lenovo Tab P12-2024", title)
+
+
+def test_rejects_a_replacement_part_for_the_requested_model() -> None:
+    title = "SOULWIT Hinge for Sony WH-1000XM5 - Black"
+
+    assert not is_product_match("Sony WH-1000XM5", title)
 
 
 def test_allows_a_requested_tablet_bundle_that_includes_a_pen() -> None:
@@ -66,6 +87,35 @@ def test_literal_null_price_is_missing() -> None:
     fields = ProductFields("Lenovo Tab P12", "null", 4.7, 271)
 
     assert fields.missing_fields() == ["price"]
+
+
+def test_extracts_best_buy_customer_price() -> None:
+    html = """
+    <script type="application/ld+json">
+    {
+      "@type": "Product",
+      "name": "Recommended Product",
+      "offers": {"price": "249.99", "priceCurrency": "USD"}
+    }
+    </script>
+    <h1>Logitech MX Master 3S</h1>
+    <div data-testid="price-block-customer-price">
+      <span class="sr-only">$84.99</span><span aria-hidden="true">$ 84 99</span>
+    </div>
+    """
+
+    assert extract_product(html).price == "$84.99"
+
+
+def test_ignores_an_amazon_recommendation_price_outside_the_buy_box() -> None:
+    html = """
+    <h1 id="productTitle">Sony WH-1000XM5 Headphones</h1>
+    <section class="recommendations">
+      <span class="a-price"><span class="a-offscreen">$19.99</span></span>
+    </section>
+    """
+
+    assert extract_product(html).price is None
 
 
 def test_search_fails_cleanly_when_every_result_is_an_accessory() -> None:

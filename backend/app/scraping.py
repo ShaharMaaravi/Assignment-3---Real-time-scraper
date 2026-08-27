@@ -141,6 +141,15 @@ def _visible_page_text(html: str, limit: int = 30_000) -> str:
     return " ".join(soup.get_text(" ", strip=True).split())[:limit]
 
 
+def _usable_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = normalize_text(value)
+    if normalized.lower() in {"", "n/a", "na", "none", "not available", "null", "unknown"}:
+        return None
+    return normalized
+
+
 def _normalize_product_url(site: SiteDefinition, value: str) -> str:
     product_url = urljoin(site.base_url, value)
     parsed = urlparse(product_url)
@@ -303,23 +312,36 @@ class FirecrawlScraper:
             raise ValueError("Firecrawl selected a product that was not a sufficiently close match")
         product_url = _normalize_product_url(site, selection.product_url)
 
-        extracted = LLMProductExtraction.model_validate(
-            await self._extract_json(
-                url=product_url,
-                schema=LLMProductExtraction.model_json_schema(),
-                prompt=(
-                    f"Extract facts for the requested product {query!r}. Use only facts explicitly "
-                    "shown on this product page. Do not guess. Return null for missing fields."
-                ),
-                only_main_content=True,
-            )
+        product_data = await self._scrape_data(
+            url=product_url,
+            schema=LLMProductExtraction.model_json_schema(),
+            prompt=(
+                f"Extract facts for the requested product {query!r}. Use only facts explicitly "
+                "shown on this product page. Do not guess. Return null for missing fields."
+            ),
+            only_main_content=False,
+            include_html=True,
         )
+        extracted_data = product_data.get("json")
+        if not isinstance(extracted_data, dict):
+            raise TypeError("Firecrawl did not return structured product data")
+        extracted = LLMProductExtraction.model_validate(extracted_data)
+        html = product_data.get("html")
+        html_fields = extract_product(html) if isinstance(html, str) else ProductFields(None, None, None, None)
         return (
             ProductFields(
-                title=extracted.product_title,
-                price=extracted.price,
-                rating=extracted.average_rating,
-                review_count=extracted.review_count,
+                title=_usable_text(extracted.product_title) or html_fields.title,
+                price=_usable_text(extracted.price) or html_fields.price,
+                rating=(
+                    extracted.average_rating
+                    if extracted.average_rating is not None
+                    else html_fields.rating
+                ),
+                review_count=(
+                    extracted.review_count
+                    if extracted.review_count is not None
+                    else html_fields.review_count
+                ),
             ),
             product_url,
         )
@@ -332,12 +354,35 @@ class FirecrawlScraper:
         prompt: str,
         only_main_content: bool,
     ) -> dict[str, Any]:
+        data = await self._scrape_data(
+            url=url,
+            schema=schema,
+            prompt=prompt,
+            only_main_content=only_main_content,
+        )
+        extracted = data.get("json")
+        if not isinstance(extracted, dict):
+            raise TypeError("Firecrawl did not return structured product data")
+        return extracted
+
+    async def _scrape_data(
+        self,
+        *,
+        url: str,
+        schema: dict[str, Any],
+        prompt: str,
+        only_main_content: bool,
+        include_html: bool = False,
+    ) -> dict[str, Any]:
+        formats: list[Any] = [{"type": "json", "prompt": prompt, "schema": schema}]
+        if include_html:
+            formats.append("html")
         response = await self.client.post(
             self.endpoint,
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "url": url,
-                "formats": [{"type": "json", "prompt": prompt, "schema": schema}],
+                "formats": formats,
                 "onlyMainContent": only_main_content,
                 "waitFor": 1_500,
                 "timeout": 60_000,
@@ -350,10 +395,9 @@ class FirecrawlScraper:
         if not payload.get("success"):
             raise RuntimeError(payload.get("error") or "Firecrawl reported an unsuccessful scrape")
         data = payload.get("data")
-        extracted = data.get("json") if isinstance(data, dict) else None
-        if not isinstance(extracted, dict):
-            raise TypeError("Firecrawl did not return structured product data")
-        return extracted
+        if not isinstance(data, dict):
+            raise TypeError("Firecrawl did not return scrape data")
+        return data
 
 
 def _describe_error(exc: Exception) -> str:

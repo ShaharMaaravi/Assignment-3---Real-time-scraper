@@ -154,11 +154,17 @@ async def test_firecrawl_selects_and_extracts_structured_product_data() -> None:
         else:
             extracted = {
                 "product_title": "Example Product",
-                "price": "$99.00",
+                "price": "null",
                 "average_rating": 4.5,
                 "review_count": 42,
             }
-        return httpx.Response(200, json={"success": True, "data": {"json": extracted}})
+        data = {"json": extracted}
+        if "amazon.com/s" not in body["url"]:
+            data["html"] = (
+                '<div data-testid="price-block-customer-price">'
+                '<span class="sr-only">$99.00</span></div>'
+            )
+        return httpx.Response(200, json={"success": True, "data": data})
 
     transport = httpx.MockTransport(handle_request)
     async with httpx.AsyncClient(transport=transport) as client:
@@ -169,4 +175,5 @@ async def test_firecrawl_selects_and_extracts_structured_product_data() -> None:
     assert product_url == "https://www.amazon.com/product"
     assert len(requests) == 2
     assert requests[0]["onlyMainContent"] is False
-    assert requests[1]["onlyMainContent"] is True
+    assert requests[1]["onlyMainContent"] is False
+    assert "html" in requests[1]["formats"]
