@@ -1,6 +1,12 @@
 import pytest
 
-from app.extraction import ProductFields, extract_product, find_best_candidate, is_product_match
+from app.extraction import (
+    ProductFields,
+    extract_product,
+    extract_search_candidate,
+    find_best_candidate,
+    is_product_match,
+)
 from app.sites import SITES
 
 
@@ -148,3 +154,28 @@ def test_extracts_product_from_json_ld() -> None:
     assert result.price == "332.54 USD"
     assert result.rating == 4.7
     assert result.review_count == 1315
+
+
+def test_extracts_facts_from_the_selected_amazon_search_card() -> None:
+    html = """
+    <div data-component-type="s-search-result">
+      <h2><a href="/sony/dp/000">Sony WH-1000XM5 Headphones</a></h2>
+      <span class="a-icon-star-small"><span class="a-icon-alt">4.5 out of 5 stars</span></span>
+      <a href="/sony/dp/000#customerReviews"><span class="s-underline-text">2,000</span></a>
+    </div>
+    <div data-component-type="s-search-result">
+      <h2><a href="/wrong/dp/111">Sony headphone case</a></h2>
+      <span class="a-price"><span class="a-offscreen">$19.99</span></span>
+    </div>
+    <div data-component-type="s-search-result">
+      <h2><a href="/sony/dp/222/ref=sr_1_2">Sony WH-1000XM5 Headphones</a></h2>
+      <span class="a-price"><span class="a-offscreen">$248.00</span></span>
+      <span class="a-icon-star-small"><span class="a-icon-alt">4.3 out of 5 stars</span></span>
+      <a href="/sony/dp/222#customerReviews"><span class="s-underline-text">1,413</span></a>
+    </div>
+    """
+
+    fields, url = extract_search_candidate(html, "Sony WH-1000XM5", SITES[0])
+
+    assert fields == ProductFields("Sony WH-1000XM5 Headphones", "$248.00", 4.3, 1413)
+    assert url == "https://www.amazon.com/sony/dp/222/ref=sr_1_2"

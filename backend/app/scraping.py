@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from .extraction import (
     ProductFields,
     extract_product,
-    find_best_candidate,
+    extract_search_candidate,
     is_product_match,
     normalize_text,
 )
@@ -28,28 +28,42 @@ class ScrapeStrategy(Protocol):
     async def scrape(self, site: SiteDefinition, query: str) -> tuple[ProductFields, str]: ...
 
 
+def _merge_product_fields(primary: ProductFields, fallback: ProductFields) -> ProductFields:
+    return ProductFields(
+        title=primary.title or fallback.title,
+        price=primary.price or fallback.price,
+        rating=primary.rating if primary.rating is not None else fallback.rating,
+        review_count=(
+            primary.review_count if primary.review_count is not None else fallback.review_count
+        ),
+    )
+
+
 @dataclass(slots=True)
 class BasicScraper:
     client: httpx.AsyncClient
     method: ScrapeMethod = ScrapeMethod.BASIC
 
     async def scrape(self, site: SiteDefinition, query: str) -> tuple[ProductFields, str]:
-        html, product_url = await _fetch_product_html(self.client, site, query)
-        return extract_product(html), product_url
+        product_html, search_fields, product_url = await _fetch_product_html(
+            self.client, site, query
+        )
+        product_fields = extract_product(product_html)
+        return _merge_product_fields(product_fields, search_fields), product_url
 
 
 async def _fetch_product_html(
     client: httpx.AsyncClient,
     site: SiteDefinition,
     query: str,
-) -> tuple[str, str]:
+) -> tuple[str, ProductFields, str]:
     search_response = await client.get(site.search_url(query))
     search_response.raise_for_status()
-    candidate = find_best_candidate(search_response.text, query, site)
+    search_fields, product_url = extract_search_candidate(search_response.text, query, site)
 
-    product_response = await client.get(candidate.url)
+    product_response = await client.get(product_url)
     product_response.raise_for_status()
-    return product_response.text, candidate.url
+    return product_response.text, search_fields, product_url
 
 
 @dataclass(slots=True)
@@ -97,10 +111,13 @@ class BrowserScraper:
 
         try:
             await self._navigate(page, site.search_url(query))
-            candidate = find_best_candidate(await page.content(), query, site)
+            search_fields, product_url = extract_search_candidate(
+                await page.content(), query, site
+            )
 
-            await self._navigate(page, candidate.url)
-            return extract_product(await page.content()), candidate.url
+            await self._navigate(page, product_url)
+            product_fields = extract_product(await page.content())
+            return _merge_product_fields(product_fields, search_fields), product_url
         finally:
             await page.close()
 
@@ -132,6 +149,9 @@ class LLMProductExtraction(BaseModel):
 class ProductSelection(BaseModel):
     product_title: str
     product_url: str
+    price: str | None = None
+    average_rating: float | None = Field(default=None, ge=0, le=5)
+    review_count: int | None = Field(default=None, ge=0)
 
 
 def _visible_page_text(html: str, limit: int = 30_000) -> str:
@@ -302,8 +322,10 @@ class FirecrawlScraper:
                 schema=ProductSelection.model_json_schema(),
                 prompt=(
                     f"Find the search result that most closely matches {query!r}. "
-                    "Return its displayed title and product URL. Reject accessories, replacement "
-                    "parts, and unrelated variants unless explicitly requested. Do not invent data."
+                    "Return its displayed title and product URL, plus its displayed price, average "
+                    "rating, and review count when present on the search card. Reject accessories, "
+                    "replacement parts, and unrelated variants unless explicitly requested. Do not "
+                    "invent data."
                 ),
                 only_main_content=False,
             )
@@ -330,17 +352,33 @@ class FirecrawlScraper:
         html_fields = extract_product(html) if isinstance(html, str) else ProductFields(None, None, None, None)
         return (
             ProductFields(
-                title=_usable_text(extracted.product_title) or html_fields.title,
-                price=_usable_text(extracted.price) or html_fields.price,
+                title=(
+                    _usable_text(extracted.product_title)
+                    or html_fields.title
+                    or selection.product_title
+                ),
+                price=(
+                    _usable_text(extracted.price)
+                    or html_fields.price
+                    or _usable_text(selection.price)
+                ),
                 rating=(
                     extracted.average_rating
                     if extracted.average_rating is not None
-                    else html_fields.rating
+                    else (
+                        html_fields.rating
+                        if html_fields.rating is not None
+                        else selection.average_rating
+                    )
                 ),
                 review_count=(
                     extracted.review_count
                     if extracted.review_count is not None
-                    else html_fields.review_count
+                    else (
+                        html_fields.review_count
+                        if html_fields.review_count is not None
+                        else selection.review_count
+                    )
                 ),
             ),
             product_url,

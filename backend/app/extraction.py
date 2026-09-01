@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
@@ -180,6 +180,107 @@ def find_best_candidate(html: str, query: str, site: SiteDefinition) -> SearchCa
     if best.score < 0.35:
         raise ValueError("The search results did not contain a sufficiently similar product")
     return best
+
+
+def _comparable_url(value: str) -> str:
+    """Remove tracking details that differ between search-result and product URLs."""
+    parsed = urlsplit(value)
+    path = parsed.path
+    if "/ref=" in path:
+        path = path.split("/ref=", 1)[0]
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path.rstrip("/"), "", ""))
+
+
+def extract_search_candidate(
+    html: str,
+    query: str,
+    site: SiteDefinition,
+) -> tuple[ProductFields, str]:
+    """Extract facts shown directly on the selected search-result card."""
+    candidate = find_best_candidate(html, query, site)
+    soup = BeautifulSoup(html, "html.parser")
+
+    def fields_for(anchor: Any, title: str) -> ProductFields:
+        card = anchor.find_parent(
+            attrs={"data-component-type": "s-search-result"}
+        ) or anchor.find_parent(class_=re.compile(r"(?:sku-item|item-cell|search-result)"))
+        scope = card or anchor.parent or soup
+        price = _format_price(
+            _meta_content(
+                scope,
+                ".a-price .a-offscreen",
+                '[data-testid="price-block-customer-price"] .sr-only',
+                '[data-automation-id="product-price"]',
+                ".priceView-customer-price span",
+                ".price-current",
+            )
+        )
+        rating = _parse_rating(
+            _meta_content(
+                scope,
+                ".a-icon-star-small .a-icon-alt",
+                ".a-icon-star .a-icon-alt",
+                ".a-icon-star-mini .a-icon-alt",
+                '[aria-label*="out of 5"]',
+                '[itemprop="ratingValue"]',
+            )
+        )
+        review_count = _parse_review_count(
+            _meta_content(
+                scope,
+                'a[href*="customerReviews"] .s-underline-text',
+                'a[aria-label*="ratings"]',
+                ".a-size-base.s-underline-text",
+                '[itemprop="reviewCount"]',
+                '[aria-label*="ratings"]',
+            )
+        )
+        return ProductFields(title, price, rating, review_count)
+
+    # Prefer a slightly lower-ranked exact match with all required facts over an unavailable
+    # first result whose card and product page both omit a price.
+    complete_candidates: list[tuple[float, ProductFields, str]] = []
+    seen_urls: set[str] = set()
+    for selector in site.result_link_selectors:
+        for possible_anchor in soup.select(selector):
+            href = possible_anchor.get("href")
+            title = normalize_text(
+                str(
+                    possible_anchor.get("aria-label")
+                    or possible_anchor.get("title")
+                    or possible_anchor.get_text(" ", strip=True)
+                )
+            )
+            if not href or not is_product_match(query, title, minimum_score=0):
+                continue
+            product_url = urljoin(site.base_url, str(href))
+            comparable_url = _comparable_url(product_url)
+            if comparable_url in seen_urls:
+                continue
+            seen_urls.add(comparable_url)
+            fields = fields_for(possible_anchor, title)
+            if not fields.missing_fields():
+                complete_candidates.append((_match_score(query, title), fields, product_url))
+
+    if complete_candidates:
+        _, fields, product_url = max(complete_candidates, key=lambda item: item[0])
+        return fields, product_url
+
+    expected_url = _comparable_url(candidate.url)
+    anchor = None
+
+    for selector in site.result_link_selectors:
+        for possible_anchor in soup.select(selector):
+            href = possible_anchor.get("href")
+            if href and _comparable_url(urljoin(site.base_url, str(href))) == expected_url:
+                anchor = possible_anchor
+                break
+        if anchor is not None:
+            break
+
+    if anchor is None:
+        return ProductFields(candidate.title, None, None, None), candidate.url
+    return fields_for(anchor, candidate.title), candidate.url
 
 
 def _walk_json(value: Any) -> Iterable[dict[str, Any]]:

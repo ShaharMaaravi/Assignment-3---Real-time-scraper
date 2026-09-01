@@ -150,13 +150,16 @@ async def test_firecrawl_selects_and_extracts_structured_product_data() -> None:
             extracted = {
                 "product_title": "Example Product",
                 "product_url": "https://www.amazon.com/product",
+                "price": "$100.00",
+                "average_rating": 4.5,
+                "review_count": 42,
             }
         else:
             extracted = {
                 "product_title": "Example Product",
                 "price": "null",
-                "average_rating": 4.5,
-                "review_count": 42,
+                "average_rating": None,
+                "review_count": None,
             }
         data = {"json": extracted}
         if "amazon.com/s" not in body["url"]:
