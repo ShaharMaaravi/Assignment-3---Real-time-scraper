@@ -98,16 +98,23 @@ export default function Home() {
     setIsLoading(true);
     setError(null);
     setResponse(null);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 105_000);
 
     try {
       const apiResponse = await fetch(`${API_URL}/api/search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: normalizedQuery }),
+        signal: controller.signal,
       });
-
       if (!apiResponse.ok) {
-        throw new Error(`The search service returned HTTP ${apiResponse.status}.`);
+        const payload = (await apiResponse.json().catch(() => null)) as
+          | { detail?: string }
+          | null;
+        throw new Error(
+          payload?.detail ?? `The search service returned HTTP ${apiResponse.status}.`,
+        );
       }
 
       const data = (await apiResponse.json()) as SearchResponse;
@@ -118,8 +125,9 @@ export default function Home() {
     } catch (requestError) {
       const message =
         requestError instanceof Error ? requestError.message : "The search could not be completed.";
-      setError(`${message} Make sure the FastAPI backend is running at ${API_URL}.`);
+      setError(message);
     } finally {
+      window.clearTimeout(timeout);
       setIsLoading(false);
     }
   }

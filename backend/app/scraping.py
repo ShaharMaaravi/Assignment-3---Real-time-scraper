@@ -448,14 +448,7 @@ class ScraperService:
         self,
         strategy_factory: Callable[[httpx.AsyncClient], Sequence[ScrapeStrategy]] | None = None,
     ) -> None:
-        self._strategy_factory = strategy_factory or (
-            lambda client: (
-                BasicScraper(client),
-                BrowserScraper(),
-                LLMScraper(client),
-                FirecrawlScraper(client),
-            )
-        )
+        self._strategy_factory = strategy_factory or _default_strategy_factory
 
     async def search(self, query: str) -> list[ProductResult]:
         normalized_query = " ".join(query.split())
@@ -526,3 +519,12 @@ class ScraperService:
             method=ScrapeMethod.NOT_AVAILABLE,
             error="; ".join(errors) or "No scraping methods were configured",
         )
+
+
+def _default_strategy_factory(client: httpx.AsyncClient) -> tuple[ScrapeStrategy, ...]:
+    strategies: list[ScrapeStrategy] = [BasicScraper(client)]
+    browser_enabled = os.getenv("SCRAPER_ENABLE_BROWSER", "true").strip().lower()
+    if browser_enabled not in {"0", "false", "no", "off"}:
+        strategies.append(BrowserScraper())
+    strategies.extend((LLMScraper(client), FirecrawlScraper(client)))
+    return tuple(strategies)
